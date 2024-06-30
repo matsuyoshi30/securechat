@@ -1,0 +1,169 @@
+#+title: memo
+
+https://vaktibabat.github.io/posts/Making_A_Secure_Chat_Rust_Crypto/
+
+まずはシンプルなクラサバ形式のチャット
+
+サーバーは listen してクライアントから来るメッセージを受けとる
+
+#+begin_src rust
+async fn handle_listen(cmd: Command) -> Result<(), io::Error> {
+    let host = &cmd.args[0];
+    let port = cmd.args[1].parse::<u16>().expect("Not a valid port");
+    println!("Listening for peers on port {}", port);
+    let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
+
+    let (mut stream, _) = listener.accept().await?;
+
+    peer_loop(&mut stream).await?;
+
+    Ok(())
+}
+#+end_src
+
+[[https://docs.rs/tokio/latest/tokio/net/struct.TcpListener.html][TcpListener]] は接続を待ち受ける TCP ソケットサーバー。[[https://docs.rs/tokio/latest/tokio/net/struct.TcpListener.html#method.bind][bind]] で引数のアドレスにバインドされる新しい TcpListener を作成する。作成された TcpListener は接続を受け入れる準備ができているもの
+
+[[https://docs.rs/tokio/latest/tokio/net/struct.TcpListener.html#method.accept][accept]] で接続を受け入れる。接続が確立されるとメソッドが対応する TcpStream と相対するアドレスが返される
+
+クライアントは [[https://docs.rs/tokio/latest/tokio/net/struct.TcpStream.html][TcpStream]] の [[https://docs.rs/tokio/latest/tokio/net/struct.TcpStream.html#method.connect][connect]] で指定されたアドレスへの TCP 接続を開く
+
+#+begin_src rust
+async fn handle_connect(cmd: Command) -> Result<(), io::Error> {
+    let host = &cmd.args[0];
+    let port = cmd.args[1].parse::<u16>().expect("Invalid Port");
+
+    let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+
+    peer_loop(&mut stream).await?;
+
+    Ok(())
+}
+#+end_src
+
+サーバーもクライアントも peer_loop というのを呼んでいる
+
+#+begin_src rust
+async fn peer_loop(stream: &mut TcpStream) -> Result<(), io::Error> {
+    println!("Connection established with peer {}", stream.peer_addr()?);
+    let (mut reader, mut writer) = split(stream);
+    let mut stdin = BufReader::new(io::stdin()).lines();
+
+    loop {
+        let mut msg = [0u8; 100];
+
+        select! {
+            line = stdin.next_line() => {
+                if let Some(line) = line? {
+                    let cmd = parse_cmd(line.split_whitespace().collect());
+                    match cmd.op {
+                        Opcode::Help => help(),
+                        Opcode::Connect => println!("Please leave your current connection before connecting to another peer."),
+                        Opcode::Send => handle_send(cmd, &mut writer).await?,
+                        Opcode::Leave => break,
+                        Opcode::Quit => process::exit(0),
+                        Opcode::Listen => println!("Please leave your current connection before listening for a new peer."),
+                        Opcode::Unknown => println!("Unknown opcode. Please use help."),
+                    }
+                }
+            }
+            n = reader.read(&mut msg) => {
+                if n? == 0 {
+                    break;
+                }
+                println!("GOT {}", String::from_utf8_lossy(&msg));
+            }
+        }
+    }
+
+    Ok(())
+}
+#+end_src
+
+TcpStream を受けとって色々やっている
+
+- [[https://docs.rs/tokio/latest/tokio/io/fn.split.html][split]]
+  - TcpStream は非同期にバイトを読み書きする [[https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html][AsyncRead]], [[https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html][AsyncWrite]] を実装している
+  - split で TcpStream をそれらに分割
+- [[https://docs.rs/tokio/latest/tokio/macro.select.html][select!]]
+  - マクロ
+  - 並行な複数の処理を待機し、いずれかの処理が完了したら残りの処理をキャンセルして return する
+
+サーバーでは select! の下の処理になる。reader でバイト列を読んでそれを出力する。クライアントは標準入力をパーズして、send のときのみ次の処理 handle_send に進む
+
+#+begin_src rust
+async fn handle_send(
+    cmd: Command,
+    writer: &mut tokio::io::WriteHalf<&mut TcpStream>,
+) -> Result<(), io::Error> {
+    let mut final_str = String::new();
+
+    for word in cmd.args {
+        final_str.push_str(&word);
+        final_str.push(' ');
+    }
+
+    writer.write_all(final_str.as_bytes()).await?;
+
+    Ok(())
+}
+#+end_src
+
+標準入力の send に続く文字列から最終的な文字列 final_str を構築し、それを writer に書き込み
+
+ターミナル2つ準備して試す
+
+サーバー側。起動してアドレスとポートを指定してリッスン
+
+#+begin_src sh
+% cargo run
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.69s
+     Running `target/debug/securechat`
+listen 127.0.0.1 8888 # here
+#+end_src
+
+クライアント側。起動してアドレスとポートを指定して TCP 接続確立
+
+#+begin_src sh
+% cargo run
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/securechat`
+connect 127.0.0.1 8888 # here
+Connection established with peer 127.0.0.1:8888
+#+end_src
+
+サーバー側。クライアントとの接続が確立される
+
+#+begin_src sh
+% cargo run
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.69s
+     Running `target/debug/securechat`
+listen 127.0.0.1 8888
+Listening for peers on port 8888
+Connection established with peer 127.0.0.1:64921 # here
+#+end_src
+
+クライアント側。文字列を送信
+
+#+begin_src sh
+% cargo run
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/securechat`
+connect 127.0.0.1 8888
+Connection established with peer 127.0.0.1:8888
+send HI! MY NAME IS MATSUYOSHI. # here
+#+end_src
+
+サーバー側。受信した文字列を出力
+
+#+begin_src sh
+% cargo run
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.69s
+     Running `target/debug/securechat`
+listen 127.0.0.1 8888
+Listening for peers on port 8888
+Connection established with peer 127.0.0.1:64921
+GOT HI! MY NAME IS MATSUYOSHI. # here
+#+end_src
