@@ -167,3 +167,124 @@ Listening for peers on port 8888
 Connection established with peer 127.0.0.1:64921
 GOT HI! MY NAME IS MATSUYOSHI. # here
 #+end_src
+
+メッセージを暗号化して通信する。TTP (Trusted Third Party) サーバーを用いて、通信相手の証明書(公開鍵)の正当性を検証できるようにする
+
+TTP が自身のメッセージに付与する署名を生成したり、自分やチャット相手が「チャット時のメッセージの暗号化に使う対称鍵」を暗号するために用いる非対称暗号鍵を作るための RSA アルゴリズムを先に実装する
+
+RSA の基礎
+
+- 鍵生成
+  - 2つの大きな素数p, qを準備し、pq = nを生成
+  - φ(n) = (p-1)(q-1) を計算
+    - この関数をオイラーのトーシェント関数という
+  - 1 < e < φ(n) となる公開指数eを選択
+    - 通常はe = 65537
+  - eのf(n)に対するモジュラ逆数dを算出
+    - ed ≡ 1 mod φ(n)
+- 公開鍵と秘密鍵
+  - 公開鍵: (e, n)
+  - 秘密鍵: (p, q, d)
+- 暗号化
+  - 平文mに対して公開鍵を使って暗号化
+  - m^e mod n
+- 復号
+  - 暗号文cに対して秘密鍵を使って復号
+  - c^d mod n
+- 署名生成, 署名検証
+
+鍵生成で必要な2つの素数については、ある程度大きい乱数を生成して、それが素数かどうかを判定し、素数であれば採用するというアプローチで進める
+
+素数判定にはミラー・ラビン素数判定法を使う。ミラー・ラビン素数判定法はフェルマーの小定理をベースにしたもの
+
+フェルマーの小定理は、「pが素数であり、aとpが互いに素である整数のとき、a^(p-1)≡1 (mod p)が成立する」というもの。しかしこれを回避する数値が存在することがわかっている(カーマイケル数)
+
+ミラー・ラビン素数判定法は以下の手順
+
+- 前処理
+  - 与えられた数nが偶数もしくは2以下のとき、それは素数ではないと判定
+- 因数分解
+  - 与えられた数nから、n-1を(2^s)*dの形に因数分解する。このとき、dは奇数
+- テストの繰り返し
+  - 2 <= a <= n-2の範囲でランダムな整数aを選択
+  - a^d mod nを算出しxとする
+    - xが1もしくはn-1なら次のテストに進む
+    - xが1でもn-1でもないなら、以下をs-1回繰り返し
+      - x^2 mod nを算出しxとする
+      - xがn-1なら、次のテストに進む
+      - xが1なら、nは素数ではないと判定
+    - ここに到達するなら、nは素数ではないと判定
+
+指定された整数を(2^s)*dの形に因数分解する処理factorを実装。2で除算できる回数sをカウントして余りdを返す
+
+#+begin_src rust
+fn factor(n: &BigUint) -> (BigUint, BigUint) {
+    let mut s: BigUint = BigUint::from(0u64);
+    let mut d = n.clone();
+
+    while &d % 2u64 == BigUint::zero() {
+        s += BigUint::one();
+        d /= 2u64;
+    }
+
+    (s, d)
+}
+#+end_src
+
+factorを用いてミラー・ラビン素数判定法を実装
+
+#+begin_src rust
+fn miller_rabin_test(n: &BigUint, k: usize, rng: &mut ChaCha20Rng) -> bool {
+    if n <= &BigUint::from(2u64) {
+        return false;
+    }
+    if n % 2u64 == BigUint::zero() {
+        return false;
+    }
+
+    let (s, d) = factor(&(n - 1u64));
+
+    'outer: for _ in 0..k {
+        let a = rng.gen_biguint_range(&BigUint::from(2u64), &(n - 2u64));
+        let mut x = a.modpow(&d, n);
+
+        if x == BigUint::one() || x == n - 1u64 {
+            continue;
+        }
+
+        for _ in 1..s.to_usize().unwrap() {
+            x = x.modpow(&BigUint::from(2u64), n);
+
+            if x == BigUint::one() {
+                return false;
+            }
+            if x == n - 1u64 {
+                continue 'outer;
+            }
+        }
+
+        return false;
+    }
+
+    true
+}
+#+end_src
+
+ある程度大きい乱数を生成して、それが素数かどうかをミラー・ラビン素数判定法で判定して、素数ならそれを返す処理を実装
+
+#+begin_src rust
+pub fn gen_prime(bits: u64) -> BigUint {
+    let mut rng = ChaCha20Rng::from_entropy();
+    let byte_len = (bits / 8) as usize;
+
+    loop {
+        let mut bytes = vec![0u8; byte_len];
+        rng.fill_bytes(&mut bytes);
+        let candidate = BigUint::from_bytes_be(&bytes);
+
+        if candidate.bits() == bits && miller_rabin_test(&candidate, 12, &mut rng) {
+            return candidate;
+        }
+    }
+}
+#+end_src
