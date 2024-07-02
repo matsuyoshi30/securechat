@@ -288,3 +288,110 @@ pub fn gen_prime(bits: u64) -> BigUint {
     }
 }
 #+end_src
+
+これで自分の証明書に対する署名要求(CSR: Certificate Signing Request)を TTP に投げて、署名を得る準備ができた
+
+TTP サーバーでの、署名要求の処理
+
+#+begin_src rust
+async fn ttp_server(ip: String, port: u16) -> Result<(), io::Error> {
+    let listener = TcpListener::bind(format!("{}:{}", ip, port)).await?;
+
+    let ttp_keypair = Keypair::new(None, None);
+
+    println!("TTP Listening on {}:{}", ip, port);
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let keypair_clone = ttp_keypair.clone();
+
+        tokio::spawn(async move {
+            let msg = receive_message(&mut socket)
+                .await
+                .expect("Failed to receive message");
+            println!("Receive message: {:?}", msg.op);
+            let payload = msg.payload;
+            match msg.op {
+                MessageOpcode::RequestCertificate => {
+                    let name_length = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let to_sign = &payload[4..4 + name_length as usize + 256]; // 署名対象
+                    let digest = md5::compute(to_sign); // 署名対象のダイジェスト
+                    let signature = keypair_clone.sign(&BigUint::from_bytes_be(&digest.to_vec())); // 署名
+                    let mut resp = Message {
+                        op: MessageOpcode::CertSigned,
+                        payload: signature.to_bytes_be(),
+                    };
+                    send_message(&mut socket, &mut resp)
+                        .await
+                        .expect("Failed to send response to client");
+                    println!("Send message: {:?}", resp.op);
+                    socket.shutdown().await.expect("Failed to shutdown socket");
+                }
+                _ => println!("Unimplemented"),
+            }
+        });
+    }
+}
+#+end_src
+
+リクエストとして受けとった Message についてペイロードを確認し、ペイロードに対して自身の秘密鍵で署名を生成する
+
+次は TTP に署名要求を送信する側。チャットを行うものをピア Peer としてデータ構造を定義する。自身がもつ鍵のペアと証明書、通信先とのストリームを持つ
+
+#+begin_src rust
+pub struct Peer {
+    keypair: Keypair,
+    pub cert: Option<Certificate>,
+    pub stream: Option<TcpStream>,
+}
+
+pub struct Certificate {
+    name: String,
+    public: PublicKey,
+    signature: Vec<u8>,
+}
+#+end_src
+
+証明書への署名要求は以下のとおり Peer のメソッドとして実装
+
+#+begin_src rust
+impl Peer {
+   pub async fn get_cert(
+        &mut self,
+        host: String,
+        port: u16,
+        name: String,
+    ) -> Result<(), io::Error> {
+        let name_len = name.len() as u32;
+
+        let mut payload = vec![];
+        payload.append(&mut name_len.to_be_bytes().to_vec());
+        payload.append(&mut name.as_bytes().to_vec());
+        payload.append(&mut self.keypair.public.n.to_bytes_be());
+
+        let mut msg = Message {
+            op: MessageOpcode::RequestCertificate,
+            payload,
+        };
+
+        let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+        send_message(&mut stream, &mut msg).await?;
+        let resp = receive_message(&mut stream).await?;
+        if resp.op == MessageOpcode::CertSigned {
+            self.cert = Some(Certificate {
+                name,
+                public: self.keypair.public.clone(),
+                signature: resp.payload,
+            })
+        } else {
+            return Err(io::Error::other("The TTP did not sign the certificate"));
+        }
+
+        stream.shutdown().await?;
+
+        Ok(())
+    }
+}
+#+end_src
+
+署名要求用のメッセージを構築し、引数に受けとる情報から TTP サーバーに接続して署名要求リクエストを送信する

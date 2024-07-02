@@ -5,8 +5,8 @@ use rand_chacha::ChaCha20Rng;
 
 #[derive(Clone, Debug)]
 pub struct PublicKey {
-    e: BigUint, // Exponent
-    n: BigUint, // n = p*q
+    e: BigUint,     // Exponent
+    pub n: BigUint, // n = p*q
 }
 
 impl PublicKey {

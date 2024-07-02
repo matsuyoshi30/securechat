@@ -1,3 +1,4 @@
+use securechat::message::Peer;
 use std::process;
 use tokio::io::{self, split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +12,7 @@ enum Opcode {
     Leave,
     Quit,
     Listen,
+    GetCert,
     Unknown,
 }
 
@@ -28,6 +30,7 @@ fn parse_cmd(input: Vec<&str>) -> Command {
         "leave" => Opcode::Leave,
         "quit" => Opcode::Quit,
         "listen" => Opcode::Listen,
+        "get_cert" => Opcode::GetCert,
         _ => Opcode::Unknown,
     };
     let args = input[1..].iter().map(|s| s.to_string()).collect();
@@ -36,12 +39,13 @@ fn parse_cmd(input: Vec<&str>) -> Command {
 
 fn help() {
     println!("Commands:");
-    println!("  help                  - Show this help message");
-    println!("  connect <host> <port> - Connect to a peer");
-    println!("  send <message>        - Send a message to the connected peer");
-    println!("  leave                 - Leave the current connection");
-    println!("  quit                  - Quit the application");
-    println!("  listen <host> <port>  - Listen for incoming connections");
+    println!("  help                                     - Show this help message");
+    println!("  connect <host> <port>                    - Connect to a peer");
+    println!("  send <message>                           - Send a message to the connected peer");
+    println!("  leave                                    - Leave the current connection");
+    println!("  quit                                     - Quit the application");
+    println!("  listen <host> <port>                     - Listen for incoming connections");
+    println!("  get_cert <TTP IP> <TTP PORT> <YOUR NAME> - Ask the TTP @ TTP_IP:TTP_PORT for a cert licensed to <YOUR NAME> and save it under <FILENAME>");
 }
 
 async fn peer_loop(stream: &mut TcpStream) -> Result<(), io::Error> {
@@ -63,6 +67,7 @@ async fn peer_loop(stream: &mut TcpStream) -> Result<(), io::Error> {
                         Opcode::Leave => break,
                         Opcode::Quit => process::exit(0),
                         Opcode::Listen => println!("Please leave your current connection before listening for a new peer."),
+                        Opcode::GetCert => println!("Please leave your current connection before listening for getting certificate."),
                         Opcode::Unknown => println!("Unknown opcode. Please use help."),
                     }
                 }
@@ -119,8 +124,33 @@ async fn handle_listen(cmd: Command) -> Result<(), io::Error> {
     Ok(())
 }
 
+async fn handle_get_cert(cmd: Command, peer: &mut Peer) -> Result<(), io::Error> {
+    if cmd.args.len() < 2 {
+        return Err(io::Error::other("Invalid number of arguments"));
+    }
+
+    let host = &cmd.args[0];
+    let port = match cmd.args[1].parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => return Err(io::Error::other("Invalid port number")),
+    };
+
+    println!("Enter your name below");
+    let stdin = io::stdin();
+    let br = BufReader::new(stdin);
+    io::stdout().flush().await?;
+    let name = br.lines().next_line().await?.unwrap();
+
+    peer.get_cert(host.to_string(), port, name).await?;
+    println!("{:?}", peer.cert);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
+    let mut peer = Peer::new();
+
     let stdin = io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
@@ -134,6 +164,7 @@ async fn main() -> Result<(), io::Error> {
                 Opcode::Leave => println!("Not connected to any peer."),
                 Opcode::Quit => break,
                 Opcode::Listen => handle_listen(cmd).await?,
+                Opcode::GetCert => handle_get_cert(cmd, &mut peer).await?,
                 Opcode::Unknown => println!("Unknown opcode. Please use help."),
             }
         }
