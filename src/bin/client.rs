@@ -50,7 +50,7 @@ fn help() {
 async fn peer_loop(peer: &mut Peer) -> Result<(), io::Error> {
     println!(
         "Connection established with peer {}",
-        peer.stream.as_mut().unwrap().peer_addr().unwrap()
+        peer.peer_addr.unwrap()
     );
 
     loop {
@@ -84,7 +84,7 @@ async fn peer_loop(peer: &mut Peer) -> Result<(), io::Error> {
         }
     }
 
-    peer.stream.as_mut().unwrap().shutdown().await?;
+    peer.shutdown().await?;
     println!("Connection closed successfully");
 
     Ok(())

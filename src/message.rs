@@ -1,10 +1,12 @@
+use std::net::SocketAddr;
+
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::KeyInit;
 use aes::Aes128;
 use num_bigint::BigUint;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::aes::{decrypt, encrypt, AES_BLOCK_SIZE};
@@ -60,16 +62,15 @@ impl MessageOpcode {
     }
 }
 
-pub async fn send_message(socket: &mut TcpStream, msg: &mut Message) -> Result<usize, io::Error> {
+pub async fn send_message(stream: &mut WriteHalf<TcpStream>, msg: &mut Message) -> Result<usize, io::Error> {
     let mut data = vec![msg.op.index()];
     data.append(&mut msg.payload);
-
-    socket.write(&data).await
+    stream.write(&data).await
 }
 
-pub async fn receive_message(socket: &mut TcpStream) -> Result<Message, io::Error> {
+pub async fn receive_message(stream: &mut ReadHalf<TcpStream>) -> Result<Message, io::Error> {
     let mut buf = [0u8; MAX_MESSAGE_SIZE];
-    let n = socket.read(&mut buf).await?;
+    let n = stream.read(&mut buf).await?;
     let op = buf[0];
     let payload = buf[1..n].to_vec();
 
@@ -82,7 +83,8 @@ pub async fn receive_message(socket: &mut TcpStream) -> Result<Message, io::Erro
 pub struct Peer {
     keypair: Keypair,
     pub cert: Option<Certificate>,
-    pub stream: Option<TcpStream>,
+    pub peer_addr: Option<SocketAddr>,
+    pub stream: Option<(ReadHalf<TcpStream>, WriteHalf<TcpStream>)>,
     pub cipher: Option<Aes128>,
 }
 
@@ -91,9 +93,20 @@ impl Peer {
         Self {
             keypair: Keypair::new(None, None),
             cert: None,
+            peer_addr: None,
             stream: None,
             cipher: None,
         }
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        if let Some((_, ref mut writer)) = &mut self.stream {
+            writer.shutdown().await?;
+        }
+        self.peer_addr = None;
+        self.stream = None;
+        self.cipher = None;
+        Ok(())
     }
 
     // Ask the TTP for a certificate.
@@ -115,9 +128,10 @@ impl Peer {
             payload,
         };
 
-        let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
-        send_message(&mut stream, &mut msg).await?;
-        let resp = receive_message(&mut stream).await?;
+        let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+        let (mut reader, mut writer) = split(stream);
+        send_message(&mut writer, &mut msg).await?;
+        let resp = receive_message(&mut reader).await?;
         if resp.op == MessageOpcode::CertSigned {
             self.cert = Some(Certificate {
                 name,
@@ -128,6 +142,7 @@ impl Peer {
             return Err(io::Error::other("The TTP did not sign the certificate"));
         }
 
+        let mut stream = reader.unsplit(writer);
         stream.shutdown().await?;
 
         Ok(())
@@ -141,26 +156,31 @@ impl Peer {
         ttp_host: &String,
         ttp_port: u16,
     ) -> Result<(), io::Error> {
-        let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
-        let mut ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+        let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+        let peer_addr = stream.peer_addr().unwrap();
+        let (mut reader, mut writer) = split(stream);
+        let ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+        let (mut ttp_reader, mut ttp_writer) = split(ttp_stream);
 
         // Ask server's certificate and validate it by TTP
         let mut cert_req = Message::new(MessageOpcode::HandshakeStart, vec![]);
-        send_message(&mut stream, &mut cert_req).await?;
-        let response = receive_message(&mut stream).await?;
+        send_message(&mut writer, &mut cert_req).await?;
+        let response = receive_message(&mut reader).await?;
         let server_cert = Certificate::from_message(response).unwrap();
-        let is_cert_valid = server_cert.validate_certificate(&mut ttp_stream).await?;
+        let is_cert_valid = server_cert.validate_certificate(&mut ttp_reader, &mut ttp_writer).await?;
+        let mut ttp_stream = ttp_reader.unsplit(ttp_writer);
         ttp_stream.shutdown().await?;
 
         if !is_cert_valid {
             send_message(
-                &mut stream,
+                &mut writer,
                 &mut Message {
                     op: MessageOpcode::CertificateRejected,
                     payload: vec![],
                 },
             )
-            .await?;
+                .await?;
+            let mut stream = reader.unsplit(writer);
             stream.shutdown().await?;
 
             return Err(io::Error::other("Certificate is not valid"));
@@ -169,7 +189,7 @@ impl Peer {
         println!("Server\'s certificate is valid");
 
         send_message(
-            &mut stream,
+            &mut writer,
             &mut Message {
                 op: MessageOpcode::CertificateAccepted,
                 payload: vec![],
@@ -178,24 +198,24 @@ impl Peer {
         .await?;
 
         // Send the client's certificate to the server
-        let request = receive_message(&mut stream).await?;
+        let request = receive_message(&mut reader).await?;
         self.cert
             .as_mut()
             .unwrap()
-            .display_cert(request, &mut stream)
+            .display_cert(request, &mut writer)
             .await?;
 
         // Check if the server accepted our certificate
-        let server_resp = receive_message(&mut stream).await?;
+        let server_resp = receive_message(&mut reader).await?;
         if server_resp.op != MessageOpcode::CertificateAccepted {
+            let mut stream = reader.unsplit(writer);
             stream.shutdown().await?;
-            ttp_stream.shutdown().await?;
             return Err(io::Error::other("Handshake error"));
         }
 
         // At this point, we know the server's cert, and the server knows our cert
         // The server is supposed to send a message containing the symmetric key (bytes 0-15), and the IV for CBC (bytes 16-31)
-        let symmetric_key_msg = receive_message(&mut stream).await?;
+        let symmetric_key_msg = receive_message(&mut reader).await?;
         let encrypted_symmetric_key = symmetric_key_msg.payload;
         let symmetric_key = self
             .keypair
@@ -208,7 +228,8 @@ impl Peer {
         let cipher = Aes128::new(&symmetric_key_arr);
 
         // We now have a stream with the server, and a cipher under which to encrypt & decrypt messages
-        self.stream = Some(stream);
+        self.peer_addr = Some(peer_addr);
+        self.stream = Some((reader, writer));
         self.cipher = Some(cipher);
 
         Ok(())
@@ -224,49 +245,55 @@ impl Peer {
     ) -> Result<(), io::Error> {
         let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
 
-        let (mut stream, _) = listener.accept().await?;
-        let mut ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+        let (stream, _) = listener.accept().await?;
+        let peer_addr = stream.peer_addr().unwrap();
+        let (mut reader, mut writer) = split(stream);
 
         // Receive the client's request which would like to get the server's certificate
-        let request = receive_message(&mut stream).await?;
+        let request = receive_message(&mut reader).await?;
         self.cert
             .as_mut()
             .unwrap()
-            .display_cert(request, &mut stream)
+            .display_cert(request, &mut writer)
             .await?;
 
         // Check the client's response validating the server's certificate
-        let client_resp = receive_message(&mut stream).await?;
+        let client_resp = receive_message(&mut reader).await?;
         if client_resp.op != MessageOpcode::CertificateAccepted {
+            let mut stream = reader.unsplit(writer);
             stream.shutdown().await?;
-            ttp_stream.shutdown().await?;
             return Err(io::Error::other("Handshake error"));
         }
 
+        let ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+        let (mut ttp_reader, mut ttp_writer) = split(ttp_stream);
+
         // Ask for the client's certificate and validate it by TTP
         let mut cert_req = Message::new(MessageOpcode::HandshakeStart, vec![]);
-        send_message(&mut stream, &mut cert_req).await?;
-        let response = receive_message(&mut stream).await?;
+        send_message(&mut writer, &mut cert_req).await?;
+        let response = receive_message(&mut reader).await?;
         let client_cert = Certificate::from_message(response).unwrap();
-        let is_cert_valid = client_cert.validate_certificate(&mut ttp_stream).await?;
+        let is_cert_valid = client_cert.validate_certificate(&mut ttp_reader, &mut ttp_writer).await?;
+        let mut ttp_stream = ttp_reader.unsplit(ttp_writer);
         ttp_stream.shutdown().await?;
 
         if !is_cert_valid {
             send_message(
-                &mut stream,
+                &mut writer,
                 &mut Message {
                     op: MessageOpcode::CertificateRejected,
                     payload: vec![],
                 },
             )
             .await?;
+            let mut stream = reader.unsplit(writer);
             stream.shutdown().await?;
 
             return Err(io::Error::other("Certificate is not valid"));
         }
 
         send_message(
-            &mut stream,
+            &mut writer,
             &mut Message {
                 op: MessageOpcode::CertificateAccepted,
                 payload: vec![],
@@ -290,12 +317,13 @@ impl Peer {
             op: MessageOpcode::SymmetricKey,
             payload: encrypted_key.to_bytes_be(),
         };
-        send_message(&mut stream, &mut msg).await?;
+        send_message(&mut writer, &mut msg).await?;
 
         let symmetric_key_arr = GenericArray::from(key);
         let cipher = Aes128::new(&symmetric_key_arr);
 
-        self.stream = Some(stream);
+        self.peer_addr = Some(peer_addr);
+        self.stream = Some((reader, writer));
         self.cipher = Some(cipher);
 
         Ok(())
@@ -313,18 +341,22 @@ impl Peer {
             op: MessageOpcode::Text,
             payload: ciphertext.into_iter().flatten().collect(),
         };
-        let mut stream = self.stream.as_mut().expect("Connection establish failed");
-        send_message(&mut stream, &mut msg).await?;
+        if let Some((_, ref mut writer)) = &mut self.stream {
+            send_message(writer, &mut msg).await?;
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "No active connection"));
+        }
 
         Ok(())
     }
 
     pub async fn receive_text(&mut self) -> Result<String, io::Error> {
-        let mut stream = self
-            .stream
-            .as_mut()
-            .expect("Failed to establish connection");
-        let msg = receive_message(&mut stream).await?;
+        let msg: Message;
+        if let Some((ref mut reader, _)) = &mut self.stream {
+            msg = receive_message(reader).await?;
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "No active connection"))
+        }
 
         if msg.op != MessageOpcode::Text {
             return Err(io::Error::other(
@@ -386,7 +418,7 @@ impl Certificate {
         })
     }
 
-    async fn display_cert(&self, msg: Message, stream: &mut TcpStream) -> Result<usize, io::Error> {
+    async fn display_cert(&self, msg: Message, writer: &mut WriteHalf<TcpStream>) -> Result<usize, io::Error> {
         if msg.op != MessageOpcode::HandshakeStart {
             return Err(io::Error::other(
                 "Exepected a request for my certificate, but received something else",
@@ -398,19 +430,19 @@ impl Certificate {
             op: MessageOpcode::CertificateShow,
             payload,
         };
-        Ok(send_message(stream, &mut msg).await?)
+        Ok(send_message(writer, &mut msg).await?)
     }
 
-    async fn validate_certificate(&self, stream: &mut TcpStream) -> Result<bool, io::Error> {
+    async fn validate_certificate(&self, reader: &mut ReadHalf<TcpStream>, writer: &mut WriteHalf<TcpStream>) -> Result<bool, io::Error> {
         let payload = self.to_bytes();
 
         let mut msg = Message {
             op: MessageOpcode::ValidateCertificate,
             payload,
         };
-        send_message(stream, &mut msg).await?;
+        send_message(writer, &mut msg).await?;
 
-        let resp = receive_message(stream).await?;
+        let resp = receive_message(reader).await?;
         Ok(if resp.payload[0] == 1 { true } else { false })
     }
 

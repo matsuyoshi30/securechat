@@ -1094,4 +1094,4 @@ GOT HI! MY NAME IS ma
 
 [[./assets/wireshark2.png]]
 
-これで一通り完了。双方向じゃなくてクラサバなので双方向にしたい
+これで一通り完了
