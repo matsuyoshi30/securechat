@@ -1,3 +1,4 @@
+use std::fmt::{self, Debug};
 use std::net::SocketAddr;
 
 use aes::cipher::generic_array::GenericArray;
@@ -378,11 +379,25 @@ impl Peer {
     }
 }
 
-#[derive(Debug)]
 pub struct Certificate {
     name: String,
     public: PublicKey,
     signature: Vec<u8>,
+}
+
+impl Debug for Certificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let signature = self
+            .signature
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+        write!(
+            f,
+            "Certificate {{ name: {}, public.n: {}, public.e: {}, signature: {} }}",
+            self.name, self.public.e, self.public.n, signature,
+        )
+    }
 }
 
 impl Certificate {
