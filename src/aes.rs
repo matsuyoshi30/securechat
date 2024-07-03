@@ -2,10 +2,10 @@ use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt};
 use aes::Aes128;
 
-const AES_BLOCK_SIZE: usize = 16;
+pub const AES_BLOCK_SIZE: usize = 16;
 const IV: [u8; 16] = *b"YELLOW SUBMARINE";
 
-fn encrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
+pub fn encrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
     let bytes_padding = if m.len() % AES_BLOCK_SIZE != 0 {
         AES_BLOCK_SIZE - (m.len() % AES_BLOCK_SIZE)
     } else {
@@ -50,7 +50,7 @@ fn encrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
     ciphertext_blocks
 }
 
-fn decrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
+pub fn decrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
     // These are the blocks we XOR each decrypted cipher block with
     let mut xor_with = vec![IV];
 

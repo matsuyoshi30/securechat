@@ -152,7 +152,7 @@ Connection established with peer 127.0.0.1:64921 # here
      Running `target/debug/securechat`
 connect 127.0.0.1 8888
 Connection established with peer 127.0.0.1:8888
-send HI! MY NAME IS MATSUYOSHI. # here
+send HI! MY NAME IS ma # here
 #+end_src
 
 サーバー側。受信した文字列を出力
@@ -165,8 +165,10 @@ send HI! MY NAME IS MATSUYOSHI. # here
 listen 127.0.0.1 8888
 Listening for peers on port 8888
 Connection established with peer 127.0.0.1:64921
-GOT HI! MY NAME IS MATSUYOSHI. # here
+GOT HI! MY NAME IS ma # here
 #+end_src
+
+[[./assets/wireshark1.png]]
 
 メッセージを暗号化して通信する。TTP (Trusted Third Party) サーバーを用いて、通信相手の証明書(公開鍵)の正当性を検証できるようにする
 
@@ -508,3 +510,588 @@ fn decrypt(m: &mut [u8], cipher: &Aes128) -> Vec<[u8; AES_BLOCK_SIZE]> {
 - 暗号文をブロックに分割したベクタの各要素に対して復号を繰り返し
   - 復号後、最初に準備したベクタから、対応するものを取得してXOR
 - パディングされているならそれを削除
+
+これでメッセージを暗号化してチャットする準備ができた。Alice と Bob がチャットを行うとすると、
+
+1. Alice, Bob それぞれ自身の証明書について、TTP サーバーに証明書署名要求を送信し、署名を得る
+2. Alice が通信相手の名前を確認する
+3. Alice の通信相手の Bob が、自身の証明書を Alice に伝達する
+4. Alice は、Bob から受け取った証明書の正当性を、TTP サーバーに問い合わせて確認する
+5. Alice は、Bob から受け取った証明書の公開鍵を用いて、このあとのチャットを暗号化するのに用いる共通鍵を暗号化して Bob に送信する
+6. Bob は、Alice から受け取った暗号文について、自身の秘密鍵を用いて復号し、共通鍵を得る
+7. チャットの内容は共通鍵で暗号化してメッセージを送受信する
+
+という流れ
+
+証明書要求のリクエスト、レスポンスを整理
+
+証明書 Certificate のメソッドとして、「メッセージから証明書データを取得して返す」「証明書データをメッセージとして送信する」「証明書の検証をTTPにリクエストして検証結果を得る」という処理をつくる
+
+証明書を受け取ってそれに署名を付与して返す処理
+
+#+begin_src rust
+impl Certificate {
+    fn from_message(msg: Message) -> Result<Certificate, io::Error> {
+        if msg.op != MessageOpcode::CertificateShow {
+            return Err(io::Error::other(
+                "Expected a certificate, but received something else",
+            ));
+        }
+
+        let payload = msg.payload;
+
+        let name_length = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+        let name = String::from_utf8(payload[4..4 + name_length as usize].to_vec()).unwrap();
+        let n = BigUint::from_bytes_be(
+            &payload[4 + name_length as usize..4 + name_length as usize + N_SIZE],
+        );
+        // The length of the signature is always 256 bytes
+        // Because we raise the digest (MD5 digest is always 128-bit = 16 bytes)
+        // To the power of e=65537, and then take modulo n (2048 bits = 256 bytes)
+        // We also pad the signature when sending it in case it is smaller than 256 bytes
+        let signature = payload
+            [4 + name_length as usize + N_SIZE..4 + name_length as usize + N_SIZE + SIGNATURE_SIZE]
+            .to_vec();
+
+        Ok(Certificate {
+            name,
+            public: PublicKey {
+                e: RSA_EXP.into(),
+                n,
+            },
+            signature,
+        })
+    }
+}
+#+end_src
+
+Messageのペイロードから証明書の各種データ(name, n(public), signature)を取得して返す
+
+証明書データをメッセージとして送信する
+
+#+begin_src rust
+impl Certificate {
+    async fn display_cert(&self, msg: Message, stream: &mut TcpStream) -> Result<usize, io::Error> {
+        if msg.op != MessageOpcode::HandshakeStart {
+            return Err(io::Error::other(
+                "Exepected a request for my certificate, but received something else",
+            ));
+        }
+
+        let payload = self.to_bytes();
+        let mut msg = Message {
+            op: MessageOpcode::CertificateShow,
+            payload,
+        };
+        Ok(send_message(stream, &mut msg).await?)
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let name_length = self.name.len() as u32;
+        let name = &self.name;
+        let n = pad_bigint(&self.public.n, 2048).to_bytes_be();
+        let signature = &self.signature;
+
+        let mut payload = Vec::with_capacity(4 + name.len() + n.len() + signature.len());
+        payload.extend_from_slice(&name_length.to_be_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(&n);
+        payload.extend_from_slice(signature);
+
+        payload
+    }
+}
+
+fn pad_bigint(num: &BigUint, target_bits: usize) -> BigUint {
+    let mut bytes = num.to_bytes_be();
+    let padding_bytes = (target_bits + 7) / 8 - bytes.len();
+    bytes.resize(bytes.len() + padding_bytes, 0);
+    BigUint::from_bytes_be(&bytes)
+
+#+end_src
+
+証明書をバイト列に変換してペイロードにのせてメッセージを送信
+
+証明書の検証をTTPにリクエストして検証結果を得る
+
+#+begin_src rust
+impl Certificate {
+    async fn validate_certificate(&self, stream: &mut TcpStream) -> Result<bool, io::Error> {
+        let payload = self.to_bytes();
+
+        let mut msg = Message {
+            op: MessageOpcode::ValidateCertificate,
+            payload,
+        };
+        send_message(stream, &mut msg).await?;
+
+        let resp = receive_message(stream).await?;
+        Ok(if resp.payload[0] == 1 { true } else { false })
+    }
+}
+#+end_src
+
+streamはTTPサーバーとのストリーム。TTPでの署名検証は以下
+
+#+begin_src rust
+async fn ttp_server(ip: String, port: u16) -> Result<(), io::Error> {
+    let listener = TcpListener::bind(format!("{}:{}", ip, port)).await?;
+
+    let ttp_keypair = Keypair::new(None, None);
+
+    println!("TTP Listening on {}:{}", ip, port);
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let keypair_clone = ttp_keypair.clone();
+
+        tokio::spawn(async move {
+            let msg = receive_message(&mut socket)
+                .await
+                .expect("Failed to receive message");
+            println!("Receive message: {:?}", msg.op);
+            let payload = msg.payload;
+            match msg.op {
+                MessageOpcode::RequestCertificate => {
+                    // 略
+                }
+                MessageOpcode::ValidateCertificate => {
+                    let name_length = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let signed_part = &payload[4..4 + name_length as usize + N_SIZE];
+                    let signature = &payload
+                        [4 + name_length as usize + N_SIZE..4 + name_length as usize + N_SIZE + SIGNATURE_SIZE];
+                    let digest = md5::compute(signed_part);
+                    let is_signature_valid = keypair_clone.validate(
+                        &BigUint::from_bytes_be(&digest.to_vec()),
+                        &BigUint::from_bytes_be(signature),
+                    );
+                    let mut payload = vec![0; 1];
+                    if is_signature_valid {
+                        payload[0] = 1;
+                    }
+                    let mut resp = Message {
+                        op: MessageOpcode::CertSigned,
+                        payload,
+                    };
+                    send_message(&mut socket, &mut resp)
+                        .await
+                        .expect("Failed to send response to client");
+                    socket.shutdown().await.expect("Failed to shutdown socket");
+                }
+                _ => println!("Unimplemented"),
+            }
+        });
+    }
+}
+#+end_src
+
+署名が正当なら1、そうでないなら0をペイロードに設定してレスポンスを送信
+
+クライアントがサーバーと接続する処理
+
+#+begin_src rust
+impl Peer {
+    // Connect to server, and perform the handshake
+    pub async fn connect(
+        &mut self,
+        host: &String,
+        port: u16,
+        ttp_host: &String,
+        ttp_port: u16,
+    ) -> Result<(), io::Error> {
+        let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+        let mut ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+
+        // Ask server's certificate and validate it by TTP
+        let mut cert_req = Message::new(MessageOpcode::HandshakeStart, vec![]);
+        send_message(&mut stream, &mut cert_req).await?;
+        let response = receive_message(&mut stream).await?;
+        let server_cert = Certificate::from_message(response).unwrap();
+        let is_cert_valid = server_cert.validate_certificate(&mut ttp_stream).await?;
+        ttp_stream.shutdown().await?;
+
+        if !is_cert_valid {
+            send_message(
+                &mut stream,
+                &mut Message {
+                    op: MessageOpcode::CertificateRejected,
+                    payload: vec![],
+                },
+            )
+            .await?;
+            stream.shutdown().await?;
+
+            return Err(io::Error::other("Certificate is not valid"));
+        }
+
+        println!("Server\'s certificate is valid");
+
+        send_message(
+            &mut stream,
+            &mut Message {
+                op: MessageOpcode::CertificateAccepted,
+                payload: vec![],
+            },
+        )
+        .await?;
+
+        // Send the client's certificate to the server
+        let request = receive_message(&mut stream).await?;
+        self.cert
+            .as_mut()
+            .unwrap()
+            .display_cert(request, &mut stream)
+            .await?;
+
+        // Check if the server accepted our certificate
+        let server_resp = receive_message(&mut stream).await?;
+        if server_resp.op != MessageOpcode::CertificateAccepted {
+            stream.shutdown().await?;
+            ttp_stream.shutdown().await?;
+            return Err(io::Error::other("Handshake error"));
+        }
+
+        // At this point, we know the server's cert, and the server knows our cert
+        // The server is supposed to send a message containing the symmetric key (bytes 0-15), and the IV for CBC (bytes 16-31)
+        let symmetric_key_msg = receive_message(&mut stream).await?;
+        let encrypted_symmetric_key = symmetric_key_msg.payload;
+        let symmetric_key = self
+            .keypair
+            .private
+            .decrypt(&BigUint::from_bytes_be(&encrypted_symmetric_key));
+
+        let symmetric_key_bytes: [u8; AES_BLOCK_SIZE] =
+            symmetric_key.to_bytes_be().try_into().unwrap();
+        let symmetric_key_arr = GenericArray::from(symmetric_key_bytes);
+        let cipher = Aes128::new(&symmetric_key_arr);
+
+        // We now have a stream with the server, and a cipher under which to encrypt & decrypt messages
+        self.stream = Some(stream);
+        self.cipher = Some(cipher);
+
+        Ok(())
+    }
+}
+#+end_src
+
+- サーバーの証明書を取得
+- 取得したサーバーの証明書について、TTPに問い合わせて検証
+- サーバーに結果を送信
+  - 検証結果がOKなら処理継続
+- サーバーに、自身の証明書を送信
+  - サーバーでも、自身の証明書を検証してもらう
+  - サーバーから検証結果を受け取る。OKであれば処理継続
+- サーバーから、自身の証明書(公開鍵)を用いて暗号化された共通鍵を受け取って、それを自身の秘密鍵で復号
+- 共通鍵を用いてメッセージを暗号化してサーバーに送信
+
+サーバーがクライアントの接続を受け入れる処理
+
+#+begin_src rust
+impl Peer {
+    // Listen for client
+    pub async fn listen(
+        &mut self,
+        host: &String,
+        port: u16,
+        ttp_host: &String,
+        ttp_port: u16,
+    ) -> Result<(), io::Error> {
+        let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
+
+        let (mut stream, _) = listener.accept().await?;
+        let mut ttp_stream = TcpStream::connect(format!("{}:{}", ttp_host, ttp_port)).await?;
+
+        // Receive the client's request which would like to get the server's certificate
+        let request = receive_message(&mut stream).await?;
+        self.cert
+            .as_mut()
+            .unwrap()
+            .display_cert(request, &mut stream)
+            .await?;
+
+        // Check the client's response validating the server's certificate
+        let client_resp = receive_message(&mut stream).await?;
+        if client_resp.op != MessageOpcode::CertificateAccepted {
+            stream.shutdown().await?;
+            ttp_stream.shutdown().await?;
+            return Err(io::Error::other("Handshake error"));
+        }
+
+        // Ask for the client's certificate and validate it by TTP
+        let mut cert_req = Message::new(MessageOpcode::HandshakeStart, vec![]);
+        send_message(&mut stream, &mut cert_req).await?;
+        let response = receive_message(&mut stream).await?;
+        let client_cert = Certificate::from_message(response).unwrap();
+        let is_cert_valid = client_cert.validate_certificate(&mut ttp_stream).await?;
+        ttp_stream.shutdown().await?;
+
+        if !is_cert_valid {
+            send_message(
+                &mut stream,
+                &mut Message {
+                    op: MessageOpcode::CertificateRejected,
+                    payload: vec![],
+                },
+            )
+            .await?;
+            stream.shutdown().await?;
+
+            return Err(io::Error::other("Certificate is not valid"));
+        }
+
+        send_message(
+            &mut stream,
+            &mut Message {
+                op: MessageOpcode::CertificateAccepted,
+                payload: vec![],
+            },
+        )
+        .await?;
+
+        // At this point, we know the client's cert and vice versa
+        println!("Client\'s certificate is valid");
+
+        // Generate a symmetric key
+        let mut rng = ChaCha20Rng::from_entropy();
+        let mut key = [0u8; AES_BLOCK_SIZE];
+        rng.fill_bytes(&mut key);
+        let mut iv = [0u8; AES_BLOCK_SIZE];
+        rng.fill_bytes(&mut iv);
+        // Encrypt the symmetric key under the client's public key
+        let client_public = client_cert.public;
+        let encrypted_key = client_public.encrypt(&BigUint::from_bytes_be(&key));
+        let mut msg = Message {
+            op: MessageOpcode::SymmetricKey,
+            payload: encrypted_key.to_bytes_be(),
+        };
+        send_message(&mut stream, &mut msg).await?;
+
+        let symmetric_key_arr = GenericArray::from(key);
+        let cipher = Aes128::new(&symmetric_key_arr);
+
+        self.stream = Some(stream);
+        self.cipher = Some(cipher);
+
+        Ok(())
+    }
+}
+#+end_src
+
+- クライアントからの、サーバーの証明書取得リクエストに対して、自身の証明書データをレスポンス
+- クライアントでのサーバーの証明書検証の結果を受け取って確認
+- クライアントの証明書を取得
+- 取得したクライアントの証明書について、TTPに問い合わせて検証
+- クライアントに結果を送信
+  - 検証結果がOKなら処理継続
+- 共通鍵を生成して、クライアントの公開鍵で暗号化し、クライアントに送信
+
+平文を暗号化して送信する処理と、暗号文を受信して復号する処理
+
+#+begin_src rust
+impl Peer {
+    pub async fn send_text(&mut self, text: String) -> Result<(), io::Error> {
+        let ciphertext = encrypt(
+            &mut text.as_bytes().to_vec(),
+            self.cipher
+                .as_mut()
+                .expect("Connection Establishement failed"),
+        );
+
+        let mut msg = Message {
+            op: MessageOpcode::Text,
+            payload: ciphertext.into_iter().flatten().collect(),
+        };
+        let mut stream = self.stream.as_mut().expect("Connection establish failed");
+        send_message(&mut stream, &mut msg).await?;
+
+        Ok(())
+    }
+
+    pub async fn receive_text(&mut self) -> Result<String, io::Error> {
+        let mut stream = self
+            .stream
+            .as_mut()
+            .expect("Failed to establish connection");
+        let msg = receive_message(&mut stream).await?;
+
+        if msg.op != MessageOpcode::Text {
+            return Err(io::Error::other(
+                "Expected to find a text, but found another type of message",
+            ));
+        }
+
+        let mut ciphertext = msg.payload;
+        let plaintext_blocks = decrypt(
+            &mut ciphertext,
+            self.cipher
+                .as_mut()
+                .expect("Failed to establish connection"),
+        );
+        let plaintext =
+            String::from_utf8(plaintext_blocks.into_iter().flatten().collect()).unwrap();
+
+        Ok(plaintext)
+    }
+}
+#+end_src
+
+AESでの暗号化と復号
+
+ターミナル3つ準備して試す
+
+TTPサーバーを起動
+
+#+name: terminal TTP
+#+begin_src sh
+% cargo run --bin ttp_server 127.0.0.1 8888
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 1.24s
+     Running `target/debug/ttp_server 127.0.0.1 8888`
+TTP Listening on 127.0.0.1:8888
+#+end_src
+
+サーバー起動。自身の証明書への署名要求をTTPに送信する。証明書生成のときに名前を入力
+
+#+name: terminal Server
+#+begin_src sh
+% cargo run --bin client
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.29s
+     Running `target/debug/client`
+get_cert 127.0.0.1 8888 # input
+Enter your name below
+yo # input
+Some(Certificate { name: "yo", public: PublicKey { e: 65537, n: 10025089469955079084066899526973551992599737096291460293623097117045451894991088529713308062780487810008848508107073860396130486271116676163397259846988824632886076073623825104598153145839527724762767548218134314830308094915116036347411821043948647500054182209419073062128715186053228675519847859198657380196259655926599166513279882057849215024528010711815954516083668945327609849176954815665665071050769715827702603167144019645051286560789244760322603398508270253611412467082526768805005330852162079956711565978466022901594139047206253558492852192755934065929802794137833221034010540233445910482584634457392864969943 }, signature: [46, 235, 9, 50, 79, 214, 0, 163, 163, 225, 73, 44, 18, 48, 16, 235, 177, 199, 37, 242, 213, 47, 206, 178, 5, 155, 41, 98, 133, 80, 7, 153, 58, 133, 200, 114, 129, 214, 39, 189, 98, 155, 194, 4, 150, 40, 188, 152, 20, 55, 10, 104, 36, 131, 242, 154, 244, 214, 176, 203, 200, 190, 175, 91, 207, 58, 81, 155, 83, 209, 88, 99, 20, 52, 108, 250, 60, 144, 139, 142, 101, 94, 221, 160, 216, 179, 240, 236, 169, 245, 55, 222, 67, 186, 127, 243, 39, 139, 215, 97, 194, 113, 162, 188, 245, 84, 160, 214, 191, 122, 77, 3, 221, 213, 39, 191, 13, 59, 105, 130, 75, 148, 34, 225, 11, 204, 103, 141, 147, 227, 147, 46, 132, 135, 98, 55, 62, 51, 0, 71, 92, 106, 12, 249, 174, 7, 94, 5, 141, 195, 194, 77, 127, 99, 137, 128, 200, 115, 80, 59, 240, 244, 37, 58, 29, 162, 131, 183, 94, 231, 33, 108, 159, 137, 225, 187, 87, 76, 118, 124, 46, 39, 51, 188, 245, 198, 182, 111, 170, 159, 77, 156, 216, 5, 136, 108, 30, 20, 183, 152, 147, 75, 225, 183, 132, 159, 161, 120, 231, 230, 159, 166, 249, 156, 159, 31, 42, 175, 113, 235, 152, 133, 214, 188, 18, 38, 46, 62, 136, 162, 120, 64, 205, 130, 119, 68, 140, 38, 183, 27, 196, 39, 169, 178, 87, 73, 173, 250, 85, 129, 21, 89, 26, 68, 174, 9] })
+#+end_src
+
+クライアント起動。こちらも自身の証明書への署名要求をTTPに送信する。証明書生成のときに名前を入力
+
+#+name: terminal Client
+#+begin_src sh
+% cargo run --bin client
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/client`
+get_cert 127.0.0.1 8888 # input
+Enter your name below
+ma # input
+Some(Certificate { name: "ma", public: PublicKey { e: 65537, n: 9940505542554149684232630918799882272362822791413332267547799770531821667746136057539592701107244002842889725785875003863172372190494081391498715521696852778419694618675074530160893556550037550347978910194735032924851607350574689580727692725960479164986203470560956465003248915555837319931345032195668810249704996103990415405564065683199350168035668214519365566059343158091758859118498439531427729769101606421424867438976409479758720842047060622730903455918521213727330024039627608357985086274380359713687100152449812988482712131057907824456308773551457687800019034782430874453972203598166042083258099868270333340079 }, signature: [88, 0, 52, 177, 192, 5, 228, 83, 203, 75, 81, 40, 185, 246, 147, 50, 233, 54, 116, 10, 178, 91, 195, 89, 227, 116, 248, 240, 247, 69, 179, 110, 22, 252, 56, 164, 89, 72, 232, 39, 216, 235, 42, 251, 226, 94, 239, 47, 129, 172, 137, 238, 241, 176, 216, 143, 234, 77, 133, 10, 91, 238, 190, 196, 123, 190, 79, 132, 180, 121, 94, 47, 180, 237, 164, 225, 107, 32, 232, 67, 125, 58, 210, 238, 158, 221, 152, 5, 224, 217, 219, 254, 131, 129, 62, 16, 141, 153, 44, 169, 26, 102, 58, 216, 42, 77, 17, 70, 14, 255, 83, 2, 85, 28, 99, 189, 194, 87, 85, 54, 46, 216, 28, 236, 107, 156, 33, 145, 214, 149, 149, 240, 111, 102, 105, 22, 45, 5, 193, 60, 0, 204, 209, 237, 42, 245, 217, 226, 183, 31, 248, 3, 228, 107, 176, 154, 135, 183, 41, 18, 248, 113, 38, 15, 141, 154, 206, 65, 42, 15, 208, 17, 234, 90, 181, 21, 27, 10, 254, 61, 127, 100, 221, 239, 112, 226, 235, 192, 213, 184, 32, 190, 226, 5, 25, 249, 111, 170, 107, 123, 14, 103, 5, 203, 213, 201, 81, 237, 72, 128, 121, 50, 52, 234, 85, 22, 254, 146, 220, 47, 65, 139, 156, 140, 107, 190, 236, 98, 238, 214, 174, 150, 249, 146, 172, 209, 79, 247, 109, 153, 255, 188, 157, 164, 158, 129, 167, 151, 12, 119, 8, 114, 78, 42, 162, 148] })
+#+end_src
+
+クライアントのTTPへのCSRのパケット。内容はだいたいサーバーも同じ
+
+#+name: CSR Request
+[[./assets/csr_req.png]]
+
+メッセージの先頭にタイプがある。02: MessageOpcode::RequestCertificate
+
+#+name: CSR Response
+[[./assets/csr_res.png]]
+
+こっちもメッセージの先頭にタイプ。03: MessageOpcode::CertSigned
+
+サーバー側。アドレスとポートを指定して接続受け入れ
+
+#+name: terminal Server
+#+begin_src sh
+% cargo run --bin client
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.29s
+     Running `target/debug/client`
+# 略
+listen 127.0.0.1 8889 127.0.0.1 8888 # 自身のアドレスとポート、クライアントの証明書を検証するためのTTPサーバーのアドレスとポートを指定
+Listening for peers on port 8889
+#+end_src
+
+クライアント側。接続先のサーバーを指定して接続
+
+#+name: terminal Client
+#+begin_src sh
+% cargo run --bin client
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/client`
+# 略
+connect 127.0.0.1 8889 127.0.0.1 8888  # 接続先のアドレスとポート、クライアントの証明書を検証するためのTTPサーバーのアドレスとポートを指定
+Server's certificate is valid
+Connection established with peer 127.0.0.1:8889
+#+end_src
+
+サーバーの証明書を検証して接続確立
+
+#+name: Ask server's certificate
+[[./assets/handshake_client_to_server.png]]
+
+#+name: Response server's certificate
+[[./assets/server_cert_show.png]]
+
+#+name: Send request to TTP to validate server's certificate
+[[./assets/server_cert_validate.png]]
+
+#+name: Response certificate signature from TTP
+[[./assets/server_cert_signed.png]]
+
+#+name: Accept server's certificate
+[[./assets/server_cert_accepted.png]]
+
+サーバー側でもクライアントの証明書を検証して接続確立
+
+#+name: terminal Server
+#+begin_src sh
+% cargo run --bin client
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.29s
+     Running `target/debug/client`
+# 略
+listen 127.0.0.1 8889 127.0.0.1 8888
+Listening for peers on port 8889
+Client's certificate is valid
+Connection established with peer 127.0.0.1:61671
+#+end_src
+
+#+name: Ask client's certificate
+[[./assets/handshake_server_to_client.png]]
+
+#+name: Response client's certificate
+[[./assets/client_cert_show.png]]
+
+#+name: Send request to TTP to validate client's certificate
+[[./assets/client_cert_validate.png]]
+
+#+name: Response certificate signature from TTP
+[[./assets/client_cert_signed.png]]
+
+#+name: Accept client's certificate
+[[./assets/client_cert_accepted.png]]
+
+裏では共通鍵の交換が行われている
+
+#+name: Send symmetric key from server
+[[./assets/symmetric_key.png]]
+
+クライアントからサーバーへメッセージを暗号化して送信
+
+#+name: terminal Client
+#+begin_src sh
+% cargo run --bin client
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/client`
+# 略
+Connection established with peer 127.0.0.1:8889
+send HI! MY NAME IS ma
+#+end_src
+
+サーバーでクライアントからのメッセージを受信して復号
+
+#+name: terminal Server
+#+begin_src sh
+% cargo run --bin client
+   Compiling securechat v0.1.0 (/Users/matsuyoshi/ghq/github.com/matsuyoshi/securechat)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.29s
+     Running `target/debug/client`
+# 略
+Connection established with peer 127.0.0.1:61671
+GOT HI! MY NAME IS ma
+#+end_src
+
+[[./assets/wireshark2.png]]
+
+これで一通り完了。双方向じゃなくてクラサバなので双方向にしたい

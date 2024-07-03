@@ -3,9 +3,13 @@ use num_traits::{One, ToPrimitive, Zero};
 use rand::{self, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
+pub const N_SIZE: usize = 256;
+pub const SIGNATURE_SIZE: usize = 256;
+pub const RSA_EXP: u64 = 65537;
+
 #[derive(Clone, Debug)]
 pub struct PublicKey {
-    e: BigUint,     // Exponent
+    pub e: BigUint, // Exponent
     pub n: BigUint, // n = p*q
 }
 
@@ -37,8 +41,6 @@ pub struct Keypair {
 impl Keypair {
     pub fn new(p: Option<BigUint>, q: Option<BigUint>) -> Keypair {
         // TODO: check p and q are prime
-
-        const RSA_EXP: u64 = 65537;
 
         let p = if let Some(p) = p { p } else { gen_prime(1024) };
         let q = if let Some(q) = q { q } else { gen_prime(1024) };

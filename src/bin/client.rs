@@ -1,7 +1,6 @@
 use securechat::message::Peer;
 use std::process;
-use tokio::io::{self, split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::select;
 
 #[derive(Debug)]
@@ -48,22 +47,25 @@ fn help() {
     println!("  get_cert <TTP IP> <TTP PORT> <YOUR NAME> - Ask the TTP @ TTP_IP:TTP_PORT for a cert licensed to <YOUR NAME> and save it under <FILENAME>");
 }
 
-async fn peer_loop(stream: &mut TcpStream) -> Result<(), io::Error> {
-    println!("Connection established with peer {}", stream.peer_addr()?);
-    let (mut reader, mut writer) = split(stream);
-    let mut stdin = BufReader::new(io::stdin()).lines();
+async fn peer_loop(peer: &mut Peer) -> Result<(), io::Error> {
+    println!(
+        "Connection established with peer {}",
+        peer.stream.as_mut().unwrap().peer_addr().unwrap()
+    );
 
     loop {
-        let mut msg = [0u8; 100];
+        let stdin = io::stdin();
+        let br = BufReader::new(stdin);
+        let mut lines = br.lines();
 
         select! {
-            line = stdin.next_line() => {
+            line = lines.next_line() => {
                 if let Some(line) = line? {
                     let cmd = parse_cmd(line.split_whitespace().collect());
                     match cmd.op {
                         Opcode::Help => help(),
                         Opcode::Connect => println!("Please leave your current connection before connecting to another peer."),
-                        Opcode::Send => handle_send(cmd, &mut writer).await?,
+                        Opcode::Send => handle_send(cmd, peer).await?,
                         Opcode::Leave => break,
                         Opcode::Quit => process::exit(0),
                         Opcode::Listen => println!("Please leave your current connection before listening for a new peer."),
@@ -72,33 +74,46 @@ async fn peer_loop(stream: &mut TcpStream) -> Result<(), io::Error> {
                     }
                 }
             }
-            n = reader.read(&mut msg) => {
-                if n? == 0 {
+            text = peer.receive_text() => {
+                let unwrap_text = text.unwrap();
+                if unwrap_text.is_empty() {
                     break;
                 }
-                println!("GOT {}", String::from_utf8_lossy(&msg));
+                println!("GOT {}", unwrap_text);
             }
         }
     }
 
+    peer.stream.as_mut().unwrap().shutdown().await?;
+    println!("Connection closed successfully");
+
     Ok(())
 }
 
-async fn handle_connect(cmd: Command) -> Result<(), io::Error> {
+async fn handle_connect(cmd: Command, peer: &mut Peer) -> Result<(), io::Error> {
+    if cmd.args.len() < 4 {
+        return Err(io::Error::other("Invalid number of arguments"));
+    }
+
     let host = &cmd.args[0];
-    let port = cmd.args[1].parse::<u16>().expect("Invalid Port");
+    let port = match cmd.args[1].parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => return Err(io::Error::other("Invalid port number")),
+    };
+    let ttp_host = &cmd.args[2];
+    let ttp_port = match cmd.args[3].parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => return Err(io::Error::other("Invalid port number")),
+    };
 
-    let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+    peer.connect(host, port, ttp_host, ttp_port).await?;
 
-    peer_loop(&mut stream).await?;
+    peer_loop(peer).await?;
 
     Ok(())
 }
 
-async fn handle_send(
-    cmd: Command,
-    writer: &mut tokio::io::WriteHalf<&mut TcpStream>,
-) -> Result<(), io::Error> {
+async fn handle_send(cmd: Command, peer: &mut Peer) -> Result<(), io::Error> {
     let mut final_str = String::new();
 
     for word in cmd.args {
@@ -106,20 +121,31 @@ async fn handle_send(
         final_str.push(' ');
     }
 
-    writer.write_all(final_str.as_bytes()).await?;
+    peer.send_text(final_str).await?;
 
     Ok(())
 }
 
-async fn handle_listen(cmd: Command) -> Result<(), io::Error> {
+async fn handle_listen(cmd: Command, peer: &mut Peer) -> Result<(), io::Error> {
+    if cmd.args.len() < 4 {
+        return Err(io::Error::other("Invalid number of arguments"));
+    }
+
     let host = &cmd.args[0];
-    let port = cmd.args[1].parse::<u16>().expect("Not a valid port");
+    let port = match cmd.args[1].parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => return Err(io::Error::other("Invalid port number")),
+    };
+    let ttp_host = &cmd.args[2];
+    let ttp_port = match cmd.args[3].parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => return Err(io::Error::other("Invalid port number")),
+    };
     println!("Listening for peers on port {}", port);
-    let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
 
-    let (mut stream, _) = listener.accept().await?;
+    peer.listen(host, port, ttp_host, ttp_port).await?;
 
-    peer_loop(&mut stream).await?;
+    peer_loop(peer).await?;
 
     Ok(())
 }
@@ -159,11 +185,11 @@ async fn main() -> Result<(), io::Error> {
             let cmd = parse_cmd(line.split_whitespace().collect());
             match cmd.op {
                 Opcode::Help => help(),
-                Opcode::Connect => handle_connect(cmd).await?,
+                Opcode::Connect => handle_connect(cmd, &mut peer).await?,
                 Opcode::Send => println!("Not connected to any peer."),
                 Opcode::Leave => println!("Not connected to any peer."),
                 Opcode::Quit => break,
-                Opcode::Listen => handle_listen(cmd).await?,
+                Opcode::Listen => handle_listen(cmd, &mut peer).await?,
                 Opcode::GetCert => handle_get_cert(cmd, &mut peer).await?,
                 Opcode::Unknown => println!("Unknown opcode. Please use help."),
             }
