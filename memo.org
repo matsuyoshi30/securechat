@@ -1095,3 +1095,7 @@ GOT HI! MY NAME IS ma
 [[./assets/wireshark2.png]]
 
 これで一通り完了
+
+双方向
+
+[[./assets/bidirectional.png]]
