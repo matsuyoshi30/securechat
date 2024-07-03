@@ -53,11 +53,11 @@ async fn peer_loop(peer: &mut Peer) -> Result<(), io::Error> {
         peer.peer_addr.unwrap()
     );
 
-    loop {
-        let stdin = io::stdin();
-        let br = BufReader::new(stdin);
-        let mut lines = br.lines();
+    let stdin = io::stdin();
+    let br = BufReader::new(stdin);
+    let mut lines = br.lines();
 
+    loop {
         select! {
             line = lines.next_line() => {
                 if let Some(line) = line? {
