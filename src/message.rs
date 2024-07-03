@@ -63,7 +63,10 @@ impl MessageOpcode {
     }
 }
 
-pub async fn send_message(stream: &mut WriteHalf<TcpStream>, msg: &mut Message) -> Result<usize, io::Error> {
+pub async fn send_message(
+    stream: &mut WriteHalf<TcpStream>,
+    msg: &mut Message,
+) -> Result<usize, io::Error> {
     let mut data = vec![msg.op.index()];
     data.append(&mut msg.payload);
     stream.write(&data).await
@@ -168,7 +171,9 @@ impl Peer {
         send_message(&mut writer, &mut cert_req).await?;
         let response = receive_message(&mut reader).await?;
         let server_cert = Certificate::from_message(response).unwrap();
-        let is_cert_valid = server_cert.validate_certificate(&mut ttp_reader, &mut ttp_writer).await?;
+        let is_cert_valid = server_cert
+            .validate_certificate(&mut ttp_reader, &mut ttp_writer)
+            .await?;
         let mut ttp_stream = ttp_reader.unsplit(ttp_writer);
         ttp_stream.shutdown().await?;
 
@@ -180,7 +185,7 @@ impl Peer {
                     payload: vec![],
                 },
             )
-                .await?;
+            .await?;
             let mut stream = reader.unsplit(writer);
             stream.shutdown().await?;
 
@@ -274,7 +279,9 @@ impl Peer {
         send_message(&mut writer, &mut cert_req).await?;
         let response = receive_message(&mut reader).await?;
         let client_cert = Certificate::from_message(response).unwrap();
-        let is_cert_valid = client_cert.validate_certificate(&mut ttp_reader, &mut ttp_writer).await?;
+        let is_cert_valid = client_cert
+            .validate_certificate(&mut ttp_reader, &mut ttp_writer)
+            .await?;
         let mut ttp_stream = ttp_reader.unsplit(ttp_writer);
         ttp_stream.shutdown().await?;
 
@@ -345,7 +352,10 @@ impl Peer {
         if let Some((_, ref mut writer)) = &mut self.stream {
             send_message(writer, &mut msg).await?;
         } else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "No active connection"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "No active connection",
+            ));
         }
 
         Ok(())
@@ -356,7 +366,10 @@ impl Peer {
         if let Some((ref mut reader, _)) = &mut self.stream {
             msg = receive_message(reader).await?;
         } else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "No active connection"))
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "No active connection",
+            ));
         }
 
         if msg.op != MessageOpcode::Text {
@@ -433,7 +446,11 @@ impl Certificate {
         })
     }
 
-    async fn display_cert(&self, msg: Message, writer: &mut WriteHalf<TcpStream>) -> Result<usize, io::Error> {
+    async fn display_cert(
+        &self,
+        msg: Message,
+        writer: &mut WriteHalf<TcpStream>,
+    ) -> Result<usize, io::Error> {
         if msg.op != MessageOpcode::HandshakeStart {
             return Err(io::Error::other(
                 "Exepected a request for my certificate, but received something else",
@@ -448,7 +465,11 @@ impl Certificate {
         Ok(send_message(writer, &mut msg).await?)
     }
 
-    async fn validate_certificate(&self, reader: &mut ReadHalf<TcpStream>, writer: &mut WriteHalf<TcpStream>) -> Result<bool, io::Error> {
+    async fn validate_certificate(
+        &self,
+        reader: &mut ReadHalf<TcpStream>,
+        writer: &mut WriteHalf<TcpStream>,
+    ) -> Result<bool, io::Error> {
         let payload = self.to_bytes();
 
         let mut msg = Message {
